@@ -1,0 +1,13 @@
+[Unit]
+Description=Daily OTC Nasdaq100 / S&P500 QDII quota check
+After=network-online.target
+
+[Service]
+Type=oneshot
+KillMode=process
+WorkingDirectory=/home/jdhc/qdii-etf-alert
+Environment=DISPLAY=:1
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
+Environment=XAUTHORITY=/home/jdhc/.Xauthority
+ExecStart=/home/jdhc/miniforge3/bin/python3 /home/jdhc/qdii-etf-alert/monitor.py otc --force

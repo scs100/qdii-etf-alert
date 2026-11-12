@@ -1,0 +1,7 @@
+config.json
+daily/
+__pycache__/
+*.py[cod]
+.venv/
+.env
+.env.*

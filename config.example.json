@@ -1,0 +1,25 @@
+{
+  "premium_threshold_pct": 5.0,
+  "min_daily_limit_cny": 100,
+  "include_lof": true,
+  "require_quota": false,
+  "contacts": {
+    "phone": "",
+    "email": ""
+  },
+  "ntfy_topic": "",
+  "smtp": {
+    "host": "",
+    "port": 587,
+    "username": "",
+    "password": "",
+    "from": ""
+  },
+  "aliyun": {
+    "access_key_id": "",
+    "access_key_secret": "",
+    "sms_sign_name": "",
+    "sms_template_code": "",
+    "voice_called_show_number": ""
+  }
+}

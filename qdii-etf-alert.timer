@@ -1,0 +1,10 @@
+[Unit]
+Description=Run onshore ETF daily premium check after A-share close
+
+[Timer]
+OnCalendar=Mon-Fri 15:10:00
+Persistent=true
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target
