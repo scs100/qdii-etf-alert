@@ -1,8 +1,8 @@
 [Unit]
-Description=Run onshore ETF daily premium check after A-share close
+Description=Run onshore ETF daily premium check at 14:10
 
 [Timer]
-OnCalendar=Mon-Fri 15:10:00
+OnCalendar=Mon-Fri 14:10:00
 Persistent=true
 AccuracySec=1min
 

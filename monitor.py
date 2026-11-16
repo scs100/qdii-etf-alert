@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import fcntl
 import html as htmlmod
 import json
 import os
@@ -20,8 +21,10 @@ from datetime import datetime, timezone, timedelta
 from email.mime.text import MIMEText
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 ROOT = Path(__file__).resolve().parent
 CONFIG_PATHS = [
@@ -45,6 +48,10 @@ UA = (
 TZ = timezone(timedelta(hours=8))
 ACK_PORT = 18765
 SOUND = "/usr/share/sounds/freedesktop/stereo/alarm-clock-elapsed.oga"
+US_MARKETS = (
+    ("spx500", "标普500", "us.INX", "spx_weekly_drop_threshold_pct"),
+    ("nasdaq100", "纳指100", "us.NDX", "nasdaq_weekly_drop_threshold_pct"),
+)
 
 NASDAQ_INCLUDE = ("纳斯达克100", "纳指100", "纳指etf", "纳斯达克etf")
 SPX_INCLUDE = ("标普500",)
@@ -124,6 +131,9 @@ def load_config() -> dict[str, Any]:
     cfg.setdefault("min_daily_limit_cny", 100)
     cfg.setdefault("include_lof", True)
     cfg.setdefault("require_quota", False)
+    cfg.setdefault("market_drop_lookback_days", 5)
+    cfg.setdefault("spx_weekly_drop_threshold_pct", 5.0)
+    cfg.setdefault("nasdaq_weekly_drop_threshold_pct", 5.0)
     cfg.setdefault("ntfy_topic", "")
     cfg.setdefault("contacts", {"phone": "", "email": ""})
     cfg.setdefault("smtp", {})
@@ -897,6 +907,109 @@ def fetch_us_ref() -> dict[str, Any]:
     return out
 
 
+def completed_index_closes(payload: dict[str, Any], symbol: str,
+                           at: datetime | None = None) -> list[tuple[str, float]]:
+    """腾讯指数日线：只取已结束的美股交易日，拒绝不完整或陈旧行情。"""
+    ny_now = (at or now_cn()).astimezone(ZoneInfo("America/New_York"))
+    data = payload["data"][symbol]
+    quote_time = datetime.strptime(data["qt"][symbol][30], "%Y-%m-%d %H:%M:%S")
+    quote_time = quote_time.replace(tzinfo=ny_now.tzinfo)
+    if quote_time > ny_now + timedelta(minutes=5):
+        raise ValueError("指数行情时间在未来")
+    closes: list[tuple[str, float]] = []
+    previous = None
+    for row in data["day"]:
+        day = datetime.strptime(row[0], "%Y-%m-%d").date()
+        if previous is not None and day <= previous:
+            raise ValueError("指数日线日期未严格递增")
+        previous = day
+        if day > ny_now.date():
+            raise ValueError("指数日线日期在未来")
+        if day == ny_now.date() and ny_now.hour < 16:
+            continue
+        close = to_float(row[2])
+        if day.weekday() >= 5 or close is None or not 0 < close < float("inf"):
+            raise ValueError("指数收盘数据无效")
+        closes.append((day.isoformat(), close))
+    if not closes:
+        raise ValueError("没有已完成的指数日线")
+    last_day = datetime.strptime(closes[-1][0], "%Y-%m-%d").date()
+    # ponytail: 不引入交易日历；超过四个自然日未更新时跳过，不用旧行情触发提醒。
+    if (ny_now.date() - last_day).days > 4:
+        raise ValueError("指数日线过期")
+    if last_day > quote_time.date():
+        raise ValueError("日线晚于指数行情时间")
+    quote_completed = quote_time.date() < ny_now.date() or quote_time.hour >= 16
+    if quote_completed and last_day != quote_time.date():
+        raise ValueError("最新已收盘日线缺失")
+    # 未接早收盘日历时，保守等待16点后的行情确认，避免跨日缓存的盘中K线误报。
+    if last_day == quote_time.date() and quote_time.hour < 16:
+        raise ValueError("指数行情尚未取得收盘确认")
+    return closes
+
+
+def build_market_drop_snapshot(cfg: dict[str, Any], at: datetime | None = None) -> dict[str, Any]:
+    at = at or now_cn()
+    raw_lookback = cfg.get("market_drop_lookback_days", 5)
+    lookback = int(raw_lookback)
+    if isinstance(raw_lookback, bool) or lookback != float(raw_lookback) or not 1 <= lookback <= 252:
+        raise ValueError("跌幅观察窗口需为1至252个交易日")
+    rows, errors = [], {}
+    for kind, name, symbol, config_key in US_MARKETS:
+        try:
+            threshold = float(cfg.get(config_key, 5))
+            if not 0 < threshold < 100:
+                raise ValueError("跌幅阈值需大于0且小于100")
+            url = ("https://web.ifzq.gtimg.cn/appstock/app/usfqkline/get"
+                   f"?param={symbol},day,,,{max(40, lookback + 10)},qfq")
+            payload = json.loads(http_get_retry(url, timeout=8))
+            closes = completed_index_closes(payload, symbol, at)
+            if len(closes) < lookback + 1:
+                raise ValueError(f"不足{lookback + 1}个已完成收盘价")
+            start_date, start_close = closes[-lookback - 1]
+            end_date, end_close = closes[-1]
+            rows.append({
+                "kind": kind, "name": name, "symbol": symbol,
+                "lookback_days": lookback, "threshold_pct": threshold,
+                "start_date": start_date, "end_date": end_date,
+                "start_close": start_close, "end_close": end_close,
+                "change_pct": (end_close / start_close - 1) * 100,
+                "triggered": end_close <= start_close * (1 - threshold / 100),
+            })
+        except Exception as exc:  # noqa: BLE001
+            errors[kind] = str(exc)
+            log(f"{name}累计跌幅检查失败: {exc}")
+    return {"ts": at.isoformat(timespec="seconds"), "rows": rows, "errors": errors}
+
+
+def market_drop_alert_groups(snap: dict[str, Any], state: dict[str, Any]) -> list[tuple[str, str, str]]:
+    episodes = state.setdefault("market_drop_episodes", {})
+    groups = []
+    for row in snap["rows"]:
+        kind = row["kind"]
+        previous = episodes.get(kind) or {}
+        if row["end_date"] < previous.get("end_date", ""):
+            continue
+        if not row["triggered"]:
+            episodes[kind] = {"end_date": row["end_date"], "active": False}
+            continue
+        settings = f"{row['lookback_days']}d-{row['threshold_pct']:g}pct"
+        if previous.get("active") and previous.get("settings") == settings:
+            alert_id = previous["alert_id"]
+        else:
+            alert_id = f"drop-{kind}-{row['end_date']}-{settings}"
+        episodes[kind] = {"end_date": row["end_date"], "active": True,
+                          "settings": settings, "alert_id": alert_id}
+        title = f"{row['name']}近{row['lookback_days']}个交易日下跌{-row['change_pct']:.2f}%"
+        body = (f"{row['name']}累计涨跌 {row['change_pct']:+.2f}%（提醒阈值：下跌≥{row['threshold_pct']:g}%）\n"
+                f"起点：{row['start_date']} 收盘 {row['start_close']:g}\n"
+                f"终点：{row['end_date']} 收盘 {row['end_close']:g}\n"
+                f"来源：腾讯指数日线 {row['symbol']}；只使用已结束的美股交易日。\n"
+                "指数跌幅与国内基金溢价分别判断。同一轮达标确认后不重复提醒，恢复后再次跌破会重新提醒。")
+        groups.append((alert_id, title, body))
+    return groups
+
+
 def fair_premium(price: float | None, nav: float | None) -> float | None:
     if price is None or nav is None or not (0 < price < float("inf") and 0 < nav < float("inf")):
         return None
@@ -1076,7 +1189,7 @@ def premium_summary(row: dict[str, Any]) -> str:
     value = row.get("premium_nav")
     reference = f" 参考值{value:.4f}({row.get('premium_date') or '-'})" if value is not None else ""
     return (f"{row.get('code')} {row.get('name')} {basis}{fmt_pct(row.get('premium'))} "
-            f"收盘{row.get('price')}({row.get('trade_date') or '-'}){reference}")
+            f"现价{row.get('price')}({row.get('trade_date') or '-'}){reference}")
 
 
 def format_table(snap: dict[str, Any]) -> str:
@@ -1084,10 +1197,10 @@ def format_table(snap: dict[str, Any]) -> str:
     lines = [
         f"行情日期 {snap.get('trade_date') or '-'}  采集 {snap['ts']}  "
         f"提醒: 标普(含等权)<{float(snap.get('spx_threshold') or 3):.0f}%  纳指<{float(snap.get('threshold') or 5):.0f}%{extra}",
-        "提醒口径: ETF使用IOPV；LOF使用最近交易日已公布净值，尚未公布时使用HaoETF最新估值。公式均为(收盘价/参考值-1)×100%。",
+        "提醒口径: ETF使用IOPV；LOF使用最近交易日已公布净值，尚未公布时使用HaoETF最新估值。公式均为(采集时价格/参考值-1)×100%。",
         "静态净值溢价仅作对照，可能未反映隔夜涨跌。估值不是实时净值；参考值缺失或过期时不触发低溢价提醒。",
         "",
-        f"{'代码':<8}{'类型':<6}{'指数':<10}{'收盘价':>8}{'参考值':>10}{'参考溢价':>10}  {'口径':<10}{'参考日':<12}{'静态净值溢价':>10}{'腾讯溢价':>10}  说明",
+        f"{'代码':<8}{'类型':<6}{'指数':<10}{'现价':>8}{'参考值':>10}{'参考溢价':>10}  {'口径':<10}{'参考日':<12}{'静态净值溢价':>10}{'腾讯溢价':>10}  说明",
     ]
     for r in snap["rows"]:
         flag = "有" if r["has_quota"] else "无"
@@ -1130,9 +1243,9 @@ def format_table(snap: dict[str, Any]) -> str:
 
 
 BUY_GUIDE = (
-    "提醒后怎么买：下一交易日 9:30–15:00 用证券账户在场内直接买入即可，和买股票一样，脚本不会代下单。\n"
+    "提醒后怎么买：交易日 9:30–15:00 用证券账户在场内直接买入即可，和买股票一样，脚本不会代下单。\n"
     "暂停申购/没额度只影响场外申购和一级申赎，一般不影响场内成交。\n"
-    "提醒采用标明日期的参考值；估算溢价不是实时净值溢价，开盘后需重新核对价格与估值。"
+    "提醒采用标明日期的参考值；估算溢价不是实时净值溢价，下单前需重新核对价格与估值。"
 )
 
 
@@ -1437,15 +1550,37 @@ def nag_until_ack(cfg: dict[str, Any], alert_id: str, title: str, body: str) -> 
     log(f"nag 结束 {alert_id}")
 
 
+@contextmanager
+def nag_queue_lock():
+    # ponytail: 本机少量提醒共用文件锁；多用户并发时再拆独立队列。
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    with (STATE_DIR / "nag-queue.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
 def spawn_nag_queue(items: list[tuple[str, str, str]]) -> None:
-    save_json(
-        STATE_DIR / "nag-queue.json",
-        [{"id": alert_id, "title": title, "body": body} for alert_id, title, body in items],
-    )
-    spawn_nag(items[0][0], items[0][1], items[0][2], queue=True)
+    if not items:
+        return
+    with nag_queue_lock():
+        pending = {item["id"]: item for item in load_json(STATE_DIR / "nag-queue.json", [])
+                   if not is_acked(item["id"])}
+        for alert_id, title, body in items:
+            if not is_acked(alert_id):
+                pending[alert_id] = {"id": alert_id, "title": title, "body": body}
+        save_json(STATE_DIR / "nag-queue.json", list(pending.values()))
+        if pending:
+            first = next(iter(pending.values()))
+            spawn_nag(first["id"], first["title"], first["body"], queue=True)
 
 
 def spawn_nag(alert_id: str, title: str, body: str, queue: bool = False) -> None:
+    if not queue:
+        spawn_nag_queue([(alert_id, title, body)])
+        return
     nag_pid = STATE_DIR / "nag.pid"
     if nag_pid.exists():
         try:
@@ -1456,13 +1591,32 @@ def spawn_nag(alert_id: str, title: str, body: str, queue: bool = False) -> None
         except (ValueError, OSError):
             pass
     proc = subprocess.Popen(
-        [sys.executable, str(Path(__file__).resolve()), *(["nag-queue"] if queue else ["nag", alert_id, title, body])],
+        [sys.executable, str(Path(__file__).resolve()), "nag-queue"],
         start_new_session=True,
         stdout=open(STATE_DIR / "nag.log", "a", encoding="utf-8"),
         stderr=subprocess.STDOUT,
     )
     nag_pid.write_text(str(proc.pid), encoding="utf-8")
     log(f"已启动 nag pid={proc.pid} id={alert_id}")
+
+
+def cmd_nag_queue(cfg: dict[str, Any]) -> int:
+    pid_path = STATE_DIR / "nag.pid"
+    try:
+        while True:
+            with nag_queue_lock():
+                pending = [item for item in load_json(STATE_DIR / "nag-queue.json", [])
+                           if not is_acked(item["id"])]
+                if not pending:
+                    if pid_path.exists() and pid_path.read_text().strip() == str(os.getpid()):
+                        pid_path.unlink()
+                    return 0
+                item = pending[0]
+            nag_until_ack(cfg, str(item["id"]), str(item.get("title") or ""), str(item.get("body") or ""))
+    finally:
+        with nag_queue_lock():
+            if pid_path.exists() and pid_path.read_text().strip() == str(os.getpid()):
+                pid_path.unlink()
 
 
 def daily_json_path(trade_date: str) -> Path:
@@ -1477,7 +1631,7 @@ def rewrite_daily_csv() -> None:
         "name",
         "kind",
         "listed_type",
-        "close",
+        "price",
         "nav",
         "nav_date",
         "daily_premium_pct",
@@ -1503,7 +1657,7 @@ def rewrite_daily_csv() -> None:
                     "name": r.get("name"),
                     "kind": r.get("kind"),
                     "listed_type": r.get("listed_type"),
-                    "close": r.get("price"),
+                    "price": r.get("price"),
                     "nav": r.get("nav"),
                     "nav_date": r.get("nav_date"),
                     "daily_premium_pct": None if r.get("premium") is None else round(float(r["premium"]), 4),
@@ -1546,32 +1700,56 @@ def cmd_scan(cfg: dict[str, Any]) -> int:
     return 0
 
 
-def cmd_daily(cfg: dict[str, Any], force: bool = False, alert: bool = True) -> int:
+def check_daily_premium(cfg: dict[str, Any], force: bool = False) -> list[tuple[str, str, str]]:
     snap = build_snapshot(cfg)
     trade_date = str(snap.get("trade_date") or now_cn().strftime("%Y-%m-%d"))
     json_path = daily_json_path(trade_date)
     if json_path.exists() and not force:
         log(f"{trade_date} 日溢价已记录过，跳过。需要重跑请加 --force")
         print(format_table(load_json(json_path, snap)))
-        return 0
+        return []
     save_json(STATE_DIR / "last_snapshot.json", snap)
     save_daily_log(snap)
     print(format_table(snap))
-    if not alert:
-        return 0
     if trade_date != now_cn().strftime("%Y-%m-%d"):
         log(f"{trade_date} 为历史行情，只记录、不发当日提醒")
-        return 0
-    groups = [(gid, title, body) for gid, title, body in premium_alert_groups(snap) if not is_acked(gid)]
+        return []
+    groups = premium_alert_groups(snap)
     if not groups:
         log(f"{trade_date} 标普<{snap['spx_threshold']:.0f}% 纳指<{snap['threshold']:.0f}% 无需提醒或已确认")
-        return 0
-    spawn_nag_queue(groups)
-    return 0
+    return groups
+
+
+def cmd_daily(cfg: dict[str, Any], force: bool = False, alert: bool = True) -> int:
+    groups = []
+    status = 0
+    try:
+        groups.extend(check_daily_premium(cfg, force))
+    except Exception as exc:  # noqa: BLE001
+        log(f"场内溢价检查失败: {exc}")
+        status = 1
+    try:
+        market = build_market_drop_snapshot(cfg)
+        save_json(STATE_DIR / "last_market_drop.json", market)
+        for row in market["rows"]:
+            log(f"{row['name']}近{row['lookback_days']}个交易日涨跌{row['change_pct']:+.2f}% "
+                f"({row['start_date']}至{row['end_date']})")
+        if alert:
+            state = load_state()
+            groups.extend(market_drop_alert_groups(market, state))
+            save_state(state)
+    except Exception as exc:  # noqa: BLE001
+        log(f"指数累计跌幅检查失败: {exc}")
+        status = 1
+    if alert:
+        groups = [item for item in groups if not is_acked(item[0])]
+        if groups:
+            spawn_nag_queue(groups)
+    return status
 
 
 def cmd_watch(cfg: dict[str, Any]) -> int:
-    log("改为每个交易日收盘后跑一次，watch 现在等同 daily")
+    log("改为每个交易日14:10跑一次，watch 现在等同 daily")
     return cmd_daily(cfg, force=False, alert=True)
 
 
@@ -1765,7 +1943,8 @@ def cmd_install() -> int:
     subprocess.run(["systemctl", "--user", "enable", "--now", "qdii-etf-alert.timer"], check=False)
     subprocess.run(["systemctl", "--user", "enable", "--now", "qdii-otc-quota.timer"], check=False)
     subprocess.run(["systemctl", "--user", "enable", "--now", "qdii-otc-hot.timer"], check=False)
-    print("场内溢价: 每个交易日 15:10。标普(含等权)<3% 与 纳指<5% 各弹一条，点确认收到才停")
+    print("场内溢价: 每个交易日 14:10。标普(含等权)<3% 与 纳指<5% 各弹一条，点确认收到才停")
+    print("指数跌幅: 同在14:10检查，标普500/纳指100近5个已完成美股交易日累计下跌≥5%时独立提醒")
     print("场外额度: 工作日 09:00，以及开机后若当天还没点确认收到")
     print("场外>500元: 工作日 09:00-10:30 每10分钟弹窗，当天关掉3次即停")
     print(f"日志: {DAILY_DIR}")
@@ -1814,10 +1993,7 @@ def main() -> int:
     if cmd == "install":
         return cmd_install()
     if cmd == "nag-queue":
-        for item in load_json(STATE_DIR / "nag-queue.json", []):
-            if not is_acked(str(item.get("id") or "")):
-                nag_until_ack(cfg, str(item["id"]), str(item.get("title") or ""), str(item.get("body") or ""))
-        return 0
+        return cmd_nag_queue(cfg)
     if cmd == "nag":
         nag_until_ack(cfg, args.alert_id, args.title, args.body)
         return 0

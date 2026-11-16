@@ -3,6 +3,9 @@
   "min_daily_limit_cny": 100,
   "include_lof": true,
   "require_quota": false,
+  "market_drop_lookback_days": 5,
+  "spx_weekly_drop_threshold_pct": 5.0,
+  "nasdaq_weekly_drop_threshold_pct": 5.0,
   "contacts": {
     "phone": "",
     "email": ""
